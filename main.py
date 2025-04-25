@@ -1,16 +1,12 @@
-import os
-import time
-import json
-import re
+import os, time, json, re
 from dotenv import load_dotenv
 import openai
 from playwright.sync_api import sync_playwright
 
-# ─────────────── ENV/CONFIG ───────────────
+# ─────────────── ENV + CONFIG ───────────────
 load_dotenv()
 openai.api_key = os.getenv("OPENAI_API_KEY")
 
-# Read all non-empty env values into user_data
 user_data = {
     "username": os.getenv("COMMON_APP_ID"),
     "password": os.getenv("COMMON_APP_PASSWORD"),
@@ -19,145 +15,136 @@ user_data = {
 }
 user_data = {k: v for k, v in user_data.items() if v}
 
-USD_INR_RATE = 85.42
-PRICE_INPUT  = 1.100
-PRICE_OUTPUT = 4.400
+def log_step(icon, msg):
+    print(f"{icon} {msg}")
 
-# ─────────────── UTILS ───────────────
-
-def call_llm(prompt):
-    client = openai.OpenAI()
-    resp = client.chat.completions.create(
+# ─────────────── LLM UTILITIES ───────────────
+def call_llm(prompt: str):
+    return openai.OpenAI().chat.completions.create(
         model="gpt-4o-mini",
         messages=[{"role": "user", "content": prompt}]
     )
-    return resp
 
-def parse_selector_response(content):
-    match = re.search(r'(\{.*\})', content, re.DOTALL)
-    if match:
-        return json.loads(match.group(1))
-    sel = re.search(r"'([^']+)'|\"([^\"]+)\"|(\.[\w\-\[\]='\" ]+|#[\w\-\[\]='\" ]+)", content)
-    return sel.group(1) or sel.group(2) or sel.group(3)
+def parse_json_or_selector(text: str):
+    m = re.search(r'(\{.*\})', text, re.DOTALL)
+    if m:
+        return json.loads(m.group(1))
+    m2 = re.search(r"'([^']+)'|\"([^\"]+)\"|(\.[\w\-\[\]='\" ]+|#[\w\-\[\]='\" ]+)", text)
+    return m2.group(1) or m2.group(2) or m2.group(3)
 
-def log_cost(usage):
-    pt = usage.prompt_tokens
-    ct = usage.completion_tokens
-    cost_usd_prompt  = pt/1e6 * PRICE_INPUT
-    cost_usd_output  = ct/1e6 * PRICE_OUTPUT
-    total_usd = cost_usd_prompt + cost_usd_output
-    total_inr = total_usd * USD_INR_RATE
-    print(f"Tokens → prompt: {pt}, completion: {ct}")
-    print(f"Cost → USD ${total_usd:.6f}, INR ₹{total_inr:.2f}")
+# ─────────────── PATTERN 1: CANDIDATE LIST ───────────────
+def collect_login_candidates(page, max_cands=15):
+    terms = ["login", "sign in", "log in", "account"]
+    elems = page.locator("a,button,[role='button']")
+    cands = []
+    for i in range(min(elems.count(), 200)):
+        el = elems.nth(i)
+        txt = el.inner_text().strip()
+        aria = el.get_attribute("aria-label") or ""
+        if any(t in txt.lower() or t in aria.lower() for t in terms):
+            sel = el.evaluate(
+                "e => e.tagName.toLowerCase() + "
+                "(e.id ? '#' + e.id : '') + "
+                "(e.className ? '.' + e.className.split(' ').join('.') : '')"
+            )
+            cands.append({"selector": sel, "text": txt, "aria": aria})
+        if len(cands) >= max_cands:
+            break
+    return cands
 
-# ─────────────── SMART LOGIN BUTTON SEARCH ───────────────
-
-def find_login_elements(page):
-    login_terms = ["login", "sign in", "log in", "account", "signin", "sign-in"]
-    selectors = ["a", "button", "[role='button']", "[tabindex]"]
-    elements = page.locator(",".join(selectors))
-    html_snippets = []
-    for i in range(elements.count()):
-        text = elements.nth(i).inner_text().lower()
-        aria = elements.nth(i).get_attribute("aria-label") or ""
-        if any(term in text or term in aria.lower() for term in login_terms):
-            html = elements.nth(i).evaluate("el => el.outerHTML")
-            html_snippets.append(html)
-    return html_snippets
-
-def get_best_login_selector(html_snippets):
-    if not html_snippets:
-        return None, 0, 0
+def choose_login_selector(candidates):
     prompt = (
-        "Given this list of clickable HTML elements, pick the best selector to click to start the login process. "
-        "Output ONLY the selector string (e.g., .login-btn, #sign-in-link).\n\n"
-        f"Elements:\n{json.dumps(html_snippets)}"
+        "Here is a JSON list of clickable elements. "
+        "Pick **exactly one** selector whose click most likely opens the login form. "
+        "Reply with only the selector.\n\n" + json.dumps(candidates)
     )
     resp = call_llm(prompt)
-    selector = resp.choices[0].message.content.strip().strip('"').strip("'")
-    usage = resp.usage
-    return selector, usage.prompt_tokens, usage.completion_tokens
+    return resp.choices[0].message.content.strip().strip('"')
 
-# ─────────────── FORM FILLING/LOGIN FLOW ───────────────
+# ─────────────── PATTERN 2: CONTEXT-SLICE FORM MAPPING ───────────────
+STATIC_PROMPT = """You are given a small HTML snippet and user data.
+Identify which input each user_data key should fill, plus which selector to click to submit.
+Output ONLY a JSON mapping, mapping missing fields to null."""
 
-STATIC_PROMPT = """You are given an HTML snippet and user data.
-Identify the best selectors for each provided user data key (e.g., username, password, student_year, department)
-and the best selector for the submit button.
-Output a JSON mapping with these keys (map any missing field to null).
-Do not output anything else."""
-
-def get_form_selectors(user_data, form_html):
-    prompt = (
-        STATIC_PROMPT +
-        f"\n\nUser data: {user_data}\n\nForm HTML:\n{form_html}"
-    )
+def map_form_fields(user_data, form_html):
+    prompt = STATIC_PROMPT + f"\n\nUser data: {user_data}\n\nForm HTML:\n{form_html}"
     resp = call_llm(prompt)
-    mapping = parse_selector_response(resp.choices[0].message.content)
-    usage = resp.usage
-    return mapping, usage.prompt_tokens, usage.completion_tokens
+    return parse_json_or_selector(resp.choices[0].message.content)
 
+# ─────────────── MAIN FLOW ───────────────
 def main():
-    site_url = "https://www.saucedemo.com/"  # Change to your actual site!
+    site = "https://www.commonapp.org/"  # Change as needed
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=False)
         page = browser.new_page()
-        page.goto(site_url, timeout=60000)
+
+        log_step("🌐", f"Navigating to {site}")
+        page.goto(site, timeout=60000)
         page.wait_for_load_state("domcontentloaded")
 
-        # 1. Try to find all likely login buttons/links on the whole page
-        login_htmls = find_login_elements(page)
-        login_selector, login_pt, login_ct = get_best_login_selector(login_htmls)
-        if login_selector:
-            print(f"Clicking login: {login_selector}")
-            try:
-                page.click(login_selector)
-                time.sleep(2)
-            except Exception as e:
-                print(f"Could not click login button: {e}")
+        # 1) Click Login via Pattern 1
+        log_step("🔍", "Collecting login button candidates…")
+        cands = collect_login_candidates(page)
+        log_step("📋", f"{len(cands)} candidates found")
+
+        log_step("💡", "Asking LLM to choose login selector…")
+        login_sel = choose_login_selector(cands)
+        log_step("➡️", f"Chosen login selector: {login_sel!r}")
+
+        if page.locator(login_sel).count():
+            log_step("🖱️", f"Clicking login button ({login_sel})")
+            page.click(login_sel)
+            time.sleep(2)
         else:
-            print("No login button found, trying direct form detection...")
+            log_step("⚠️", "Candidate selector not found on page; skipping click")
 
-        print(f"Login selector LLM tokens: prompt={login_pt}, completion={login_ct}")
-        print(f"Login selector cost: USD ${((login_pt/1e6)*PRICE_INPUT + (login_ct/1e6)*PRICE_OUTPUT):.6f}, INR ₹{((login_pt/1e6)*PRICE_INPUT + (login_ct/1e6)*PRICE_OUTPUT)*USD_INR_RATE:.2f}")
-
-        # 2. Wait for login form/modal to appear
+        # 2) Wait for form, extract only that <form> HTML
+        log_step("📄", "Waiting for login form to appear…")
         page.wait_for_selector("form")
         form_html = page.locator("form").first.inner_html()
+        log_step("✂️", "Extracted form HTML snippet")
 
-        # 3. Ask LLM for selectors for all user fields + submit
-        mapping, pt, ct = get_form_selectors(user_data, form_html)
-        print("Field mapping:", mapping)
-        print(f"Form fill LLM tokens: prompt={pt}, completion={ct}")
-        print(f"Form fill cost: USD ${((pt/1e6)*PRICE_INPUT + (ct/1e6)*PRICE_OUTPUT):.6f}, INR ₹{((pt/1e6)*PRICE_INPUT + (ct/1e6)*PRICE_OUTPUT)*USD_INR_RATE:.2f}")
+        # 3) Map fields via Pattern 2
+        log_step("🤖", "Mapping form fields with LLM…")
+        mapping = map_form_fields(user_data, form_html)
+        log_step("🗺️", f"Field mapping result: {mapping}")
 
-        # 4. Fill and click as appropriate
-        for field, value in user_data.items():
-            sel = mapping.get(field)
-            if sel:
-                try:
-                    page.fill(sel, value)
-                    print(f"Filled {field} into {sel}")
-                except Exception as e:
-                    print(f"Could not fill {field}: {e}")
+        # 4) Fill fields
+        log_step("✏️", "Filling form fields…")
+        filled = set()
+        for k, v in user_data.items():
+            sel = mapping.get(k)
+            if sel and page.locator(sel).count():
+                page.fill(sel, v)
+                filled.add(k)
+                log_step("✅", f"Filled {k} → {sel}")
             else:
-                print(f"⚠️ No selector for {field}")
+                log_step("⚠️", f"No selector for {k}; skipped")
 
-        if mapping.get("submit"):
-            try:
-                page.click(mapping["submit"])
-                print(f"Clicked submit ({mapping['submit']})")
-            except Exception as e:
-                print(f"Could not click submit: {e}")
+        # 5) Heuristic submit detection
+        log_step("🔘", "Detecting submit button…")
+        submit = None
+        for key, sel in mapping.items():
+            if key not in filled and sel and page.locator(sel).count():
+                tag = page.locator(sel).evaluate("e => e.tagName").lower()
+                typ = page.locator(sel).get_attribute("type") or ""
+                txt = page.locator(sel).inner_text().lower()
+                if (
+                    tag == "button"
+                    or (tag == "input" and typ.lower() == "submit")
+                    or re.search(r"submit|login|continue|next", txt)
+                ):
+                    submit = sel
+                    break
+        if submit:
+            log_step("🖱️", f"Clicking submit button ({submit})")
+            page.click(submit)
         else:
-            print("⚠️ No submit button found in mapping")
+            log_step("⚠️", "No submit button found; exiting without click")
 
-        print("▶ Automation complete — inspect browser. Close window to exit.")
-        try:
-            while True: time.sleep(1)
-        except KeyboardInterrupt:
-            pass
-
+        log_step("🏁", "Automation complete — inspect browser and close to exit")
+        page.wait_for_timeout(5000)
         browser.close()
 
 if __name__ == "__main__":
