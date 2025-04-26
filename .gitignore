@@ -1,0 +1,51 @@
+# Python specific
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Environment variables
+.env
+
+# Virtual environments
+venv/
+
+# IDE specific
+.vscode/
+.idea/
+
+# Logs
+*.log
+
+# Byte-compiled / optimized / DLL files
+*.pyc
+*.pyo
+*.pyd
+
+# Test results
+*.xml
+*.out
+*.err
+
+# macOS specific
+.DS_Store
+
+# Windows specific
+Thumbs.db
+desktop.ini
+
+# Playwright specific
+playwright/.cache
+
+# Miscellaneous
+*.swp
+*.swo
+*.bak
+*.tmp
+*.old
+*.orig
+*.rej
+*.sublime-workspace
+*.sublime-project
+
+# OpenAI API keys
+openai_api_key.json
